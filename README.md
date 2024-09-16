@@ -35,7 +35,7 @@ make bench
 Supported runtime parameters:
 
 ```
---engine=<name>            (storage engine name, default: kvtree3)
+--engine=<name>            (storage engine name, default: cmap)
 --db=<location>            (path to persistent pool, default: /dev/shm/pmemkv)
                            (note: file on DAX filesystem, DAX device, or poolset file)
 --db_size_in_gb=<integer>  (size of persistent pool to create in GB, default: 0)
@@ -102,6 +102,7 @@ make baseline_cpp
 make baseline_java
 make baseline_nodejs
 make baseline_ruby
+make baseline_python
 ```
 
 <a name="examples"></a>
@@ -117,6 +118,7 @@ make example_cpp
 make example_java
 make example_nodejs
 make example_ruby
+make example_python
 ```
 
 Iteration
@@ -127,6 +129,7 @@ These measure iteration performance against a dataset with 100M keys. (15GB tota
 ```
 make iteration_cpp
 make iteration_java
+make iteration_python
 ```
 
 Storage Efficiency

@@ -23,20 +23,26 @@
 #include "histogram.h"
 #include "mutexlock.h"
 #include "random.h"
-#include "libpmemkv.h"
+#include "libpmemkv.hpp"
 
 static const std::string USAGE =
         "pmemkv_bench\n"
-        "--engine=<name>            (storage engine name, default: tree3)\n"
+        "--engine=<name>            (storage engine name, default: cmap)\n"
         "--db=<location>            (path to persistent pool, default: /dev/shm/pmemkv)\n"
         "                           (note: file on DAX filesystem, DAX device, or poolset file)\n"
         "--db_size_in_gb=<integer>  (size of persistent pool to create in GB, default: 0)\n"
-        "                           (note: always use 0 with poolset or device DAX configs)\n"
+        "                           (note: always use 0 with existing poolset or device DAX configs)\n"
+        "                           (note: when pool path is non-existing, value should be > 0)\n"
         "--histogram=<0|1>          (show histograms when reporting latencies)\n"
         "--num=<integer>            (number of keys to place in database, default: 1000000)\n"
         "--reads=<integer>          (number of read operations, default: 1000000)\n"
         "--threads=<integer>        (number of concurrent threads, default: 1)\n"
+        "--key_size=<integer>         (size of keys in bytes, default: 16)\n"
         "--value_size=<integer>     (size of values in bytes, default: 100)\n"
+        "--readwritepercent=<integer> (Ratio of reads to reads/writes (expressed "
+        "as percentage) for the ReadRandomWriteRandom workload. The default value "
+        "90 means 90% operations out of all reads and writes operations are reads. "
+        "In other words, 9 gets for every 1 put.) type: int32 default: 90\n"
         "--benchmarks=<name>,       (comma-separated list of benchmarks to run)\n"
         "    fillseq                (load N values in sequential key order)\n"
         "    fillrandom             (load N values in random key order)\n"
@@ -54,7 +60,7 @@ static const char *FLAGS_benchmarks =
         "fillrandom,overwrite,fillseq,readrandom,readseq,readrandom,readmissing,readrandom,deleteseq";
 
 // Default engine name
-static const char *FLAGS_engine = "tree3";
+static const char *FLAGS_engine = "cmap";
 
 // Number of key/values to place in database
 static int FLAGS_num = 1000000;
@@ -74,7 +80,7 @@ static int FLAGS_value_size = 100;
 static bool FLAGS_histogram = false;
 
 // Use the db with the following name.
-static const char *FLAGS_db = NULL;
+static const char *FLAGS_db = "/dev/shm/pmemkv";
 
 // Use following size when opening the database.
 static int FLAGS_db_size_in_gb = 0;
@@ -85,7 +91,7 @@ static const int FLAGS_ops_between_duration_checks = 1000;
 
 static const int FLAGS_duration = 0;
 
-static const int FLAGS_readwritepercent = 90;
+static int FLAGS_readwritepercent = 90;
 
 using namespace leveldb;
 
@@ -355,7 +361,7 @@ private:
 
 class Benchmark {
 private:
-    pmemkv::KVEngine *kv_;
+    pmem::kv::db *kv_;
     int num_;
     int value_size_;
     int key_size_;
@@ -442,8 +448,15 @@ public:
     }
 
     void GenerateKeyFromInt(uint64_t v, int64_t num_keys, Slice* key) {
-        char* str = const_cast<char*>(key->data());
-        snprintf(str, key->size(), "%016lu", v);
+        char *start = const_cast<char *>(key->data());
+        char *pos = start;
+
+        int bytes_to_fill = std::min(key_size_ - static_cast<int>(pos - start), 8);
+        memcpy(pos, static_cast<void *>(&v), bytes_to_fill);
+        pos += bytes_to_fill;
+        if (key_size_ > pos - start) {
+            memset(pos, '0', key_size_ - (pos - start));
+        }
     }
 
     void Run() {
@@ -465,6 +478,7 @@ public:
             num_ = FLAGS_num;
             reads_ = (FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads);
             value_size_ = FLAGS_value_size;
+            key_size_ = FLAGS_key_size;
 
             void (Benchmark::*method)(ThreadState *) = NULL;
             bool fresh_db = false;
@@ -501,7 +515,7 @@ public:
 
             if (fresh_db) {
                 if (kv_ != NULL) {
-                    pmemkv::KVEngine::Stop(kv_);
+                    delete kv_;
                     kv_ = NULL;
                 }
                 if (FLAGS_db_size_in_gb > 0) {
@@ -512,7 +526,7 @@ public:
             }
 
             if (kv_ == NULL) {
-                Open();
+                Open(fresh_db);
             }
 
             if (method != NULL) {
@@ -599,16 +613,39 @@ private:
         delete[] arg;
     }
 
-    void Open() {
+    void Open(bool fresh_db) {
         assert(kv_ == NULL);
         auto start = g_env->NowMicros();
-        auto size = std::to_string(1024ULL * 1024ULL * 1024ULL * FLAGS_db_size_in_gb);
-        kv_ = pmemkv::KVEngine::Start(FLAGS_engine, std::string("{\"path\":\"") + FLAGS_db + "\",\"size\":" + size + "}");
-        if (kv_ == nullptr) {
+        auto size = 1024ULL * 1024ULL * 1024ULL * FLAGS_db_size_in_gb;
+        pmemkv_config *cfg = pmemkv_config_new();
+        int ret = 0;
+
+        if (cfg == nullptr)
+            throw std::runtime_error("creating config failed");
+
+        ret = pmemkv_config_put_string(cfg, "path", FLAGS_db);
+        if(ret != 0)
+            throw std::runtime_error("putting 'path' to config failed");
+
+        if(fresh_db) {
+            ret = pmemkv_config_put_uint64(cfg, "force_create", 1);
+            if (ret != 0)
+                throw std::runtime_error("putting 'force_create' to config failed");
+
+            ret = pmemkv_config_put_uint64(cfg, "size", size);
+            if (ret != 0)
+                throw std::runtime_error("putting size to config failed");
+        }
+
+        kv_ = new pmem::kv::db;
+        auto s = kv_->open(FLAGS_engine, cfg);
+
+        if (s !=  pmem::kv::status::OK) {
             fprintf(stderr, "Cannot start engine (%s) for path (%s) with %i GB capacity\n\n%s",
                     FLAGS_engine, FLAGS_db, FLAGS_db_size_in_gb, USAGE.c_str());
             exit(-42);
         }
+
         fprintf(stdout, "%-12s : %11.3f millis/op;\n", "open", ((g_env->NowMicros() - start) * 1e-3));
     }
 
@@ -618,19 +655,20 @@ private:
             snprintf(msg, sizeof(msg), "(%d ops)", num_);
             thread->stats.AddMessage(msg);
         }
+        std::unique_ptr<const char[]> key_guard;
+        Slice key = AllocateKey(key_guard);
 
-        KVStatus s;
+        pmem::kv::status s;
         int64_t bytes = 0;
         for (int i = 0; i < num_; i++) {
             const int k = seq ? i : (thread->rand.Next() % FLAGS_num);
-            char key[100];
-            snprintf(key, sizeof(key), "%016d", k);
+            GenerateKeyFromInt(k, FLAGS_num, &key);
             std::string value = std::string();
             value.append(value_size_, 'X');
-            s = kv_->Put(key, value);
-            bytes += value_size_ + strlen(key);
+            s = kv_->put(key.ToString(), value);
+            bytes += value_size_ + key.size();
             thread->stats.FinishedSingleOp();
-            if (s != OK) {
+            if (s != pmem::kv::status::OK) {
                 fprintf(stdout, "Out of space at key %i\n", i);
                 exit(1);
             }
@@ -647,17 +685,18 @@ private:
     }
 
     void DoRead(ThreadState *thread, bool seq, bool missing) {
-        KVStatus s;
+        pmem::kv::status s;
         int64_t bytes = 0;
         int found = 0;
+        std::unique_ptr<const char[]> key_guard;
+        Slice key = AllocateKey(key_guard);
         for (int i = 0; i < reads_; i++) {
             const int k = seq ? i : (thread->rand.Next() % FLAGS_num);
-            char key[100];
-            snprintf(key, sizeof(key), missing ? "%016d!" : "%016d", k);
+            GenerateKeyFromInt(k, FLAGS_num, &key);
             std::string value;
-            if (kv_->Get(key, &value) == OK) found++;
+            if (kv_->get(key.ToString(), &value) == pmem::kv::status::OK) found++;
             thread->stats.FinishedSingleOp();
-            bytes += value.length() + strlen(key);
+            bytes += value.length() + key.size();
         }
         thread->stats.AddBytes(bytes);
         char msg[100];
@@ -678,11 +717,12 @@ private:
     }
 
     void DoDelete(ThreadState *thread, bool seq) {
+        std::unique_ptr<const char[]> key_guard;
+        Slice key = AllocateKey(key_guard);
         for (int i = 0; i < num_; i++) {
             const int k = seq ? i : (thread->rand.Next() % FLAGS_num);
-            char key[100];
-            snprintf(key, sizeof(key), "%016d", k);
-            kv_->Remove(key);
+            GenerateKeyFromInt(k, FLAGS_num, &key);
+            kv_->remove(key.ToString());
             thread->stats.FinishedSingleOp();
         }
     }
@@ -719,17 +759,17 @@ private:
             }
 
             GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
-            KVStatus s;
+            pmem::kv::status s;
 
             if (write_merge == kWrite) {
-                s = kv_->Put(key.ToString(), gen.Generate(value_size_).ToString());
+                s = kv_->put(key.ToString(), gen.Generate(value_size_).ToString());
             } else {
                 fprintf(stderr, "Merge operation not supported\n");
                 exit(1);
             }
             written++;
 
-            if (s != OK) {
+            if (s != pmem::kv::status::OK) {
                 fprintf(stderr, "Put error\n");
                 exit(1);
             }
@@ -754,6 +794,7 @@ private:
         int put_weight = 0;
         int64_t reads_done = 0;
         int64_t writes_done = 0;
+        int64_t bytes = 0;
         Duration duration(FLAGS_duration, readwrites_);
 
         std::unique_ptr<const char[]> key_guard;
@@ -768,29 +809,33 @@ private:
                 put_weight = 100 - get_weight;
             }
             if (get_weight > 0) {
-                KVStatus s = kv_->Get(key.ToString(), &value);
-                if (s == NOT_FOUND) {
+                value.clear();
+                pmem::kv::status s = kv_->get(key.ToString(), &value);
+                if (s == pmem::kv::status::OK) {
                     found++;
-                } else if (s != OK) {
+                } else if (s != pmem::kv::status::NOT_FOUND) {
                     fprintf(stderr, "get error\n");
                 }
 
+                bytes += value.length() + key.size();
                 get_weight--;
                 reads_done++;
                 thread->stats.FinishedSingleOp();
             } else if (put_weight > 0) {
                 // then do all the corresponding number of puts
                 // for all the gets we have done earlier
-                KVStatus s = kv_->Put(key.ToString(), gen.Generate(value_size_).ToString());
-                if (s != OK) {
+                pmem::kv::status s = kv_->put(key.ToString(), gen.Generate(value_size_).ToString());
+                if (s != pmem::kv::status::OK) {
                     fprintf(stderr, "put error\n");
                     exit(1);
                 }
+                bytes += key.size() + value_size_;
                 put_weight--;
                 writes_done++;
                 thread->stats.FinishedSingleOp();
             }
         }
+        thread->stats.AddBytes(bytes);
         char msg[100];
         snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
                 " total:%" PRIu64 " found:%" PRIu64 ")",
@@ -826,8 +871,12 @@ int main(int argc, char **argv) {
             FLAGS_reads = n;
         } else if (sscanf(argv[i], "--threads=%d%c", &n, &junk) == 1) {
             FLAGS_threads = n;
+        } else if (sscanf(argv[i], "--key_size=%d%c", &n, &junk) == 1) {
+            FLAGS_key_size = n;
         } else if (sscanf(argv[i], "--value_size=%d%c", &n, &junk) == 1) {
             FLAGS_value_size = n;
+        } else if (sscanf(argv[i], "--readwritepercent=%d%c", &n, &junk) == 1) {
+            FLAGS_readwritepercent = n;
         } else if (strncmp(argv[i], "--db=", 5) == 0) {
             FLAGS_db = argv[i] + 5;
         } else if (sscanf(argv[i], "--db_size_in_gb=%d%c", &n, &junk) == 1) {
@@ -836,11 +885,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
             exit(1);
         }
-    }
-
-    // Choose a location for the test database if none given with --db=<path>
-    if (FLAGS_db == NULL) {
-        FLAGS_db = "/dev/shm/pmemkv";
     }
 
     // Run benchmark against default environment
